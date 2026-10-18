@@ -18,3 +18,22 @@ override.tf.json
 # OS / Editor
 .DS_Store
 .vscode/
+
+# AWS resource configuration backups
+docs/aws-config/
+
+# Local environment files
+.env
+.env.*
+!.env.example
+
+# Terraform backend configuration
+backend.hcl
+backend.hcl.local
+
+# Terraform plan files
+*.tfplan
+tfplan
+
+# Legacy CloudWatch Agent configuration
+config/amazon-cloudwatch-agent.json

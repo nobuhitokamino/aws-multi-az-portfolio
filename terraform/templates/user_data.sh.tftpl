@@ -1,0 +1,41 @@
+#!/bin/bash
+set -euo pipefail
+
+# UserDataの実行ログを保存
+exec > >(tee -a /var/log/user-data.log) 2>&1
+
+echo "Starting EC2 initialization..."
+
+# パッケージのインストール
+dnf install -y nginx amazon-cloudwatch-agent
+
+# Nginx設定ファイルを配置
+cat > /etc/nginx/nginx.conf <<'NGINXCONF'
+${nginx_config}
+NGINXCONF
+
+# HTMLファイルを配置
+cat > /usr/share/nginx/html/index.html <<'HTML'
+${index_html}
+HTML
+
+# Nginx設定を検証して起動
+nginx -t
+systemctl enable --now nginx
+
+# CloudWatch Agent設定ファイルを配置
+cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json <<'CWCONFIG'
+${agent_config}
+CWCONFIG
+
+# CloudWatch Agentを起動
+/opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
+  -a fetch-config \
+  -m ec2 \
+  -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json \
+  -s
+
+# SSM Agentを有効化
+systemctl enable --now amazon-ssm-agent
+
+echo "EC2 initialization completed."
