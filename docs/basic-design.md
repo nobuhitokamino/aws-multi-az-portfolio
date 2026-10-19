@@ -5,7 +5,8 @@
 本システムは、AWS上に構築する高可用性とセキュリティを考慮したWebサーバー環境である。
 
 東京リージョンの2つのアベイラビリティゾーン（AZ）を使用し、
-各AZのプライベートサブネットにEC2を配置する。
+両AZのプライベートサブネットをAuto Scaling Group（ASG）の起動先とし、
+通常は各AZに1台、合計2台のEC2を配置する。インスタンスの配置・置換はASGが管理する。
 
 Amazon Route 53で独自ドメインのDNS管理を行い、
 AWS Certificate Manager（ACM）で発行した証明書を使用してHTTPS通信を実現する。
@@ -30,10 +31,15 @@ Terraformによってインフラ構成をコード化する。
 | ACM | SSL/TLS証明書の管理 | HTTPS通信を実現するため |
 | ALB | HTTPS終端・リダイレクト・負荷分散 | 通信の暗号化、負荷分散、障害時の切り替えのため |
 | EC2 | Webサーバー | Nginxで静的HTMLを配信するため |
+| Auto Scaling Group | EC2の台数維持・異常インスタンスの置換 | ELBヘルスチェックに基づく自動復旧とMulti-AZ配置のため |
+| Launch Template | EC2の起動設定 | AMI、EBS、IAM、User Dataを共通化するため |
 | AWS WAF | Webアクセスの検査・制御 | 不正なHTTPリクエストを制限するため |
 | Security Group | 通信制御 | 必要な通信のみ許可するため |
 | Systems Manager Session Manager | EC2の管理 | SSHポートを開放せずにプライベートEC2を管理するため |
-| SSM Interface Endpoint | Systems Managerへの接続 | NAT Gatewayを使わずにプライベート通信でEC2を管理するため |
+| SSM・SSM Messages Interface Endpoint | Systems Managerへの接続 | NAT Gatewayを使わずにプライベート通信でEC2を管理するため |
+| CloudWatch Logs Interface Endpoint | Nginxログの送信 | NAT Gatewayを使わずにプライベート通信でログを送信するため |
+| S3（ALBログ用） | ALBアクセスログの保存 | リクエストの調査と30日経過後の自動削除のため |
+| SNS | アラームのメール通知 | 異常発生と正常復帰を管理者へ通知するため |
 | S3 Gateway Endpoint | パッケージ取得 | NAT Gatewayを使わずにAmazon Linux 2023のリポジトリへアクセスするため |
 | IAM | アクセス権限の管理 | EC2に必要最小限の権限を付与するため |
 | CloudWatch | 監視 | EC2やALBの状態を確認するため |
@@ -58,9 +64,14 @@ Terraformによってインフラ構成をコード化する。
 | Private Subnet 1 | 10.0.11.0/24 | ap-northeast-1a | EC2 |
 | Private Subnet 2 | 10.0.12.0/24 | ap-northeast-1c | EC2 |
 
+Public/PrivateともにPublic IP自動割り当ては無効にする。
+Public Subnetは共通のPublic Route Tableから `0.0.0.0/0 → IGW` を使用する。
+Private Subnetは1つのPrivate Route Tableを共用し、VPC内通信とS3 Gateway Endpointの経路を使用する。
+Private側にインターネットへのデフォルトルートは設定しない。
+
 ### 3.3 通信経路
 
-利用者は独自ドメイン（www.kamino-infra.com）を使用してWebサイトへアクセスする。
+利用者は独自ドメイン（portfolio.kamino-infra.com）を使用してWebサイトへアクセスする。
 
 Route 53のDNSレコードによってドメイン名をALBのアドレスへ名前解決する。
 
@@ -87,7 +98,11 @@ S3 Gateway Endpointをプライベートサブネットの
 ルートテーブルに関連付ける。
 
 これにより、NAT Gatewayを使用せずに
-Nginxなどのパッケージを取得する。
+NginxやCloudWatch Agentなどのパッケージを取得する。
+
+SSM、SSM Messages、CloudWatch Logsの3種類のInterface Endpointを
+両Private Subnetに配置し、Private DNSを有効にする。
+これらはEC2の管理とログ送信に使用する。Interface Endpoint用Security Groupでは、EC2用Security GroupからのHTTPS（TCP 443）のインバウンド通信を許可する。
 
 ## 4. DNS・HTTPS設計
 
@@ -96,17 +111,19 @@ Nginxなどのパッケージを取得する。
 | 項目 | 設定 |
 |---|---|
 | ドメイン | kamino-infra.com |
-| 公開URL | https://www.kamino-infra.com |
+| 公開URL | https://portfolio.kamino-infra.com |
 | DNS | Amazon Route 53 |
 | DNSレコード | ALBを参照するAレコード（Alias） |
 
 ### 4.2 HTTPS設計
 
-- AWS Certificate Manager（ACM）でパブリック証明書を発行する
-- 証明書の検証にはDNS検証を使用する
+- AWS Certificate Manager（ACM）で発行済みの既存パブリック証明書を参照する
+- Terraformは公開FQDNに一致するISSUED証明書のうち最新のものをdata sourceで取得する
+- DNS検証は証明書を事前に用意する際の手順であり、現行Terraformは証明書や検証用CNAMEを作成しない
 - ALBのHTTPSリスナー（443）にACM証明書を設定する
 - HTTPリスナー（80）はHTTPS（443）へ301リダイレクトする
 - ALBからEC2への通信はHTTP（80）を使用する
+- TLSポリシーは `ELBSecurityPolicy-TLS13-1-2-2021-06` を使用する
 
 ## 5. サーバー設計
 
@@ -115,25 +132,30 @@ Nginxなどのパッケージを取得する。
 | 項目 | 設定 |
 |---|---|
 | 用途 | Webサーバー |
-| インスタンス数 | 2台 |
+| インスタンス数 | ASG管理：min=2 / desired=2 / max=3 |
 | AMI | Amazon Linux 2023 |
-| AMI管理方針 | 構築時に選定したAMI IDを固定 |
+| AMI管理方針 | SSM Public Parameterから最新AMIを動的取得 |
 | インスタンスタイプ | t3.micro |
 | CPUアーキテクチャ | x86_64 |
-| ストレージ | EBS gp3 8GiB |
+| ストレージ | EBS gp3 10GiB、暗号化、インスタンス終了時に削除 |
 | 配置先 | Private Subnet 1、Private Subnet 2 |
 | パブリックIP | 割り当てない |
+| 起動設定 | Launch Template、IMDSv2必須、User Data |
+| ASGヘルスチェック | ELB、起動猶予600秒 |
 
 ### 5.2 AMI管理方針
 
-構築時点で利用可能なAmazon Linux 2023のAMIを選定し、
-AMI IDをTerraformの変数として管理する。
+TerraformのdevルートでSSM Public Parameter
+`/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64` を参照し、
+取得したAMI IDをcomputeモジュールの変数へ渡す。
 
-2台のEC2には同一のAMIを使用し、
-環境の一貫性と再現性を確保する。
+同一Launch Templateバージョンから起動するEC2には同一のAMIを使用し、
+起動設定を共通化する。実行時点で最新AMIが変わるため、AMI IDまで固定した再現ではない。
 
-AMIを更新する際は、新しいAMIで動作検証を実施した後、
-Terraformの設定を変更する。|
+AMI更新時はplanでAMI IDとLaunch Templateの差分を確認し、
+新しいAMIで動作検証を実施する。ASGは最新のLaunch Templateバージョン番号を参照するが、
+既存インスタンスを一斉更新するInstance Refreshの設定はないため、
+既存インスタンスへの反映方法は別途計画する。実行時のAMI IDを記録する。
 
 ### 5.3 ミドルウェア
 
@@ -151,6 +173,10 @@ EC2の起動時にUser Dataを実行し、以下の初期設定を行う。
 - Nginxのインストール
 - Nginxの起動と自動起動設定
 - 静的HTMLファイルの配置
+- `config/nginx.conf` と `userdata/index.html` をUser Dataへ埋め込み、Nginx設定を検証して起動
+- CloudWatch Agentのインストール、動的生成したログ収集設定の配置と起動
+- SSM Agentの有効化と起動
+- User Dataの実行ログを `/var/log/user-data.log` に保存
 
 ### 5.5 サーバー管理
 
@@ -190,21 +216,28 @@ EC2の起動時にUser Dataを実行し、以下の初期設定を行う。
 EC2にIAMロールを付与し、
 AmazonSSMManagedInstanceCoreポリシーを使用する。
 
+Nginxログ用のカスタムインラインポリシーも付与する。
+ログストリームの作成・参照・イベント送信は対象ロググループに限定し、
+`logs:DescribeLogGroups` は `*` に許可する。
+CloudWatchAgentServerPolicyは付与しない。
+
 ### 6.5 AWS WAF
 
 ALBにAWS WAFを関連付け、以下のルールを設定する。
 
 - AWS Managed Rules Common Rule Set
-- Rate-based Rule
+- 検証用カスタムルール `block-test-header`（優先順位0）
 
-検証時にはテスト用ルールを使用し、
-WAFによるブロック動作を確認する。
+マネージドルールの優先順位は1で、各ルールのアクションに従う。
+カスタムルールは `x-portfolio-test` ヘッダの値が `block-me` と完全一致する場合にBlockする。
+デフォルトアクションはAllowとし、レートベースルールは定義しない。
+検証時にはこのヘッダを使用し、WAFによるブロック動作を確認する。
 
 ## 7. 可用性設計
 
 ### 7.1 Multi-AZ構成
 
-Webサーバーを異なる2つのAZに1台ずつ配置し、
+ASGの起動先を異なる2つのAZに設定し、通常はWebサーバーを1台ずつ配置して、
 単一AZまたは単一Webサーバーの障害による
 サービス停止リスクを低減する。
 
@@ -233,15 +266,27 @@ ALBのヘルスチェックで異常と判定されたEC2は、
 
 異常が解消し、ヘルスチェックで正常と判定された場合は、
 再び振り分け対象に戻す。
+ASGによって既に置換された場合は、新しいEC2が初期化・正常判定を経て振り分け対象になる。
 
 ### 7.4 復旧方針
 
-本構成ではEC2の自動復旧は実装しない。
+本構成ではASGによる異常インスタンスの自動置換を実装する。
+ASGはELBヘルスチェックを使用し、起動猶予は600秒、台数はmin=2 / desired=2 / max=3とする。
 
 障害発生時はSession Managerを使用して原因を調査し、
 必要に応じてNginxの再起動などを実施する。
+ASGが先にインスタンスを置換する可能性があるため、調査時はASGのアクティビティも確認する。
 
-Auto Scalingによる自動復旧は今後の拡張課題とする。
+CPU負荷に連動するスケーリングポリシーは定義していない。max=3は台数上限であり、
+CPUアラームによって自動で3台へ増加する設定ではない。
+
+検証状況はTerraform定義・過去のAWS実機確認・未検証を区別する。
+過去にNginx停止、ALBのhealthy/unhealthy遷移、ASGによるインスタンス置換、
+片系障害中に観測したHTTP 200の継続を確認している。AZ全体の障害試験は未実施である。
+WAF BLOCKログは過去のTerraform planで確認済みだが、applyとCloudWatch Logsへの配送確認は未実施である。
+今回の照合はコードと資料の静的確認であり、AWS実機試験やplanの再実行は行っていない。
+その他の過去の確認内容と根拠、未検証事項は[照合結果](reconciliation.md)に記録する。
+
 
 ## 8. 監視設計
 
@@ -260,17 +305,23 @@ Amazon CloudWatchを使用し、EC2およびALBの
 
 | 監視対象 | メトリクス | アラーム条件 | 通知 |
 |---|---|---|---|
-| EC2 | CPUUtilization | 80%以上が5分間継続 | SNS |
-| EC2 | StatusCheckFailed | 1以上 | SNS |
-| ALB | HealthyHostCount | 2未満 | SNS |
-| ALB | HTTPCode_Target_5XX_Count | 5分間で5件以上 | SNS |
+| EC2（ASG単位） | CPUUtilization / Average | 80%以上、5分×2回 | SNS（ALARM・OK） |
+| ALB・Target Group | UnHealthyHostCount / Maximum | 1以上、1分×2回 | SNS（ALARM・OK） |
+| ALB | HTTPCode_ELB_5XX_Count / Sum | 1件以上、1分×1回 | SNS（ALARM・OK） |
+
+CPUはASG名、5XXはALB、UnHealthyHostCountはALBとTarget Groupをディメンションに指定する。
+欠損データはCPUで `missing`、ALBの2項目で `notBreaching` とする。
+StatusCheckFailed、HealthyHostCount、Target生成5XXのアラームは定義しない。
 
 ### 8.3 通知設計
 
-CloudWatchアラームがALARM状態になった場合、
+CloudWatchアラームがALARM状態またはOK状態へ遷移した場合、
 Amazon SNSを使用して管理者へメール通知する。
 
-SNSトピックを作成し、通知先メールアドレスを登録する。
+SNSトピック `aws-multi-az-portfolio-alarms` を作成し、
+変数 `alert_email` で通知先メールアドレスを登録する。メール購読は受信者による承認が必要である。
+SNSトピックポリシーは、同一アカウント・東京リージョン・プロジェクト名接頭辞の
+CloudWatchアラームからのPublishを許可する。
 
 ### 8.4 障害時の対応
 
@@ -281,6 +332,7 @@ EC2の調査が必要な場合はSession Managerで接続し、
 Nginxの稼働状況やログを確認する。
 
 原因を特定した後、必要に応じてNginxの再起動などを実施する。
+ASGが先にインスタンスを置換する可能性があるため、調査時はASGのアクティビティも確認する。
 
 ### 8.5 ログ監視・管理
 
@@ -297,7 +349,13 @@ EC2上のNginxのログを収集・保存する。
 プライベートEC2からCloudWatch Logsへ接続するため、
 CloudWatch Logs Interface Endpointを設置する。
 
-ログの保存期間は7日間とする。
+Nginxログは `/aws-multi-az-portfolio/dev/nginx` に14日間保存する。
+ストリームは `{instance_id}/access` と `{instance_id}/error` に分離する。
+
+ALBアクセスログは専用S3バケットの `alb/` 配下へ保存し、ライフサイクルで30日後に削除する。
+S3はSSE-S3暗号化、パブリックアクセス禁止、BucketOwnerEnforcedを設定する。
+WAFログは `aws-waf-logs-aws-multi-az-portfolio` に14日保持し、BLOCKのみKEEP、その他はDROPする。
+WAFログはplan確認済みであり、applyと配送確認は未実施である。
 
 ## 9. 運用・管理設計
 
@@ -312,6 +370,9 @@ AWSリソースの構成管理にはTerraformを使用し、
 ### 9.2 構成管理
 
 - AWSリソースは原則としてTerraformで作成・変更・削除する
+- 既存ドメイン、Hosted Zone、ACM証明書は作成・削除対象に含めない
+- StateはS3 Backendを使用し、State用S3は `terraform/bootstrap` でdev環境とは別管理にする
+- Backend設定はGit管理対象外の `backend.hcl` で渡す。READMEにS3ロックファイル利用の記述があるが、`use_lockfile` の実効値は未確認である
 - Terraformコードと設計書はGitHubでバージョン管理する
 - 構成変更前にterraform planで変更内容を確認する
 - 変更後は動作確認を実施する
@@ -338,13 +399,15 @@ ALBのヘルスチェックが正常に戻ったことを確認する。
 ### 9.5 ログ管理
 
 - NginxのアクセスログとエラーログをCloudWatch Logsに収集する
-- ログの保存期間は7日間とする
+- Nginxログは14日、ALBアクセスログは30日、WAF BLOCKログは14日とする
+- WAFログのapply・配送確認は未実施とし、plan確認と実機検証を区別する
 - 障害発生時はCloudWatch Logsでログを確認する
 - 必要に応じてSession ManagerでEC2に接続し、詳細調査を行う
 
 ### 9.6 更新管理
 
-- AMIは選定したバージョンを固定して使用する
+- AMIはSSM Public Parameterから動的取得し、planで変更を確認して実際のAMI IDを記録する
+- Launch Template更新だけでは既存インスタンスを一斉置換しないため、更新反映を別途計画する
 - AMIやミドルウェアの更新時は動作検証を行う
 - 変更内容はGitHubで管理する
 
@@ -352,5 +415,6 @@ ALBのヘルスチェックが正常に戻ったことを確認する。
 
 - 学習・検証時のみAWSリソースを稼働させる
 - 検証終了後はterraform destroyで管理対象リソースを削除する
-- Route 53の既存ドメインとホストゾーンは削除対象に含めない
+- Route 53の既存ドメインとホストゾーン、および既存ACM証明書は削除対象に含めない
+- State用S3は別管理で `prevent_destroy=true`。ALBログ用S3は `force_destroy=true` のため、dev環境削除時にログが残っていても削除される
 - 検証後はAWSコンソールでリソースの削除状況を確認する

@@ -33,7 +33,7 @@ AWSの主要サービスを組み合わせ、異なるアベイラビリティ�
 - ap-northeast-1a
 - ap-northeast-1c
 
-インターネットからのアクセスは、Route 53を経由してALBに振り分けられます。
+利用者が独自ドメインにアクセスすると、Route 53によってドメイン名がALBのアドレスに名前解決されます。その後、利用者からALBへHTTPS通信が行われます。
 
 ALBでHTTPS通信を終端し、Private Subnet内のEC2（Nginx）へHTTP通信でリクエストを転送します。
 
