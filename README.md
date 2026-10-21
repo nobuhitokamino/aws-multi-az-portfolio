@@ -10,7 +10,7 @@ AWSの主要サービスを組み合わせ、異なるアベイラビリティ�
 
 その後、TerraformによるInfrastructure as Code（IaC）を実装し、インフラ構成のコード化・再現性の向上に取り組みました。
 
-また、Webサーバーを意図的に停止する障害試験を実施し、ALBによる異常検知、Auto Scaling Groupによる自動復旧、正常なWebサーバーによるサービス継続を検証しました。
+また、Webサーバーを意図的に停止する障害試験を実施し、ALBのヘルスチェックによる異常検知、Auto Scaling GroupによるEC2の自動交換、復旧後の正常動作を確認しました。
 
 ### 構築の目的
 
@@ -163,71 +163,96 @@ SSM、SSM Messages、CloudWatch LogsのInterface VPC Endpointを両方のAZに�
 | ALBアクセスログ | S3 | 30日 |
 | WAFのBLOCKログ | CloudWatch Logs | 14日 |
 
-WAFログについてはTerraformで設定を追加し、planによる構成検証まで完了しています。
-
-実際のログ配送は今後の検証対象です。
-
 ---
 
 ## 7. 動作検証・障害試験
 
-### 7.1 HTTPS通信確認
+TerraformによるAWS環境の再構築後、HTTPS通信、負荷分散、自動復旧、セキュリティ、監視・ログ収集の動作検証を実施しました。
 
-独自ドメインを使用してHTTPS通信を確認しました。
+### 7.1 Terraformによる環境構築
 
-確認結果：
+`terraform apply` を実行し、55リソースの新規作成に成功しました。
 
-- HTTPアクセス：301リダイレクト
-- HTTPSアクセス：HTTP 200
-- ACM証明書によるHTTPS通信
+検証終了後は `terraform destroy` により55リソースを削除し、Terraform Stateに管理対象リソースが残っていないことを確認しました。
 
-### 7.2 WAFの通信遮断試験
+### 7.2 HTTPS通信・負荷分散試験
 
-カスタムルールを設定し、特定のHTTPヘッダーを含むリクエストを遮断する動作を確認しました。
+独自ドメインへのHTTPS通信でHTTP 200、HTTPからHTTPSへのリダイレクトでHTTP 301を確認しました。
 
-通常のリクエスト：HTTP 200
+ALB経由で30回のHTTPSリクエストを送信し、すべてHTTP 200で応答しました。
 
-遮断対象のリクエスト：HTTP 403
+ALBアクセスログから、次の振り分け結果を確認しました。
 
-### 7.3 CloudWatch・SNS通知試験
+| AZ | 処理件数 | 割合 |
+|---|---:|---:|
+| ap-northeast-1a | 14件 | 46.7% |
+| ap-northeast-1c | 16件 | 53.3% |
 
-CloudWatchアラームの状態をテスト用に変更し、SNSによるメール通知を確認しました。
+異なるAZの2台のEC2にリクエストが振り分けられることを確認しました。
 
-- OK → ALARM
-- ALARM → OK
-- SNS通知アクション実行
-- メール受信
+### 7.3 Auto Scaling Group自動復旧試験
 
-### 7.4 EC2自動復旧試験
+以下の2種類の試験を実施しました。
 
-EC2が1台の構成でNginxサービスを停止しました。
+**試験A：EC2の手動終了**
 
-確認結果：
+希望容量を2台に維持したままEC2を1台終了し、ASGによる代替インスタンスの自動起動を確認しました。
 
-1. ALBヘルスチェックがunhealthyへ変化
-2. Auto Scaling Groupが異常を検知
-3. 異常なEC2の終了処理
-4. 新しいEC2の自動起動
-5. UserDataによるNginxの自動構築
-6. ALBヘルスチェックがhealthyへ復帰
-7. HTTPS通信がHTTP 200へ復旧
+**試験B：Nginx停止**
 
-### 7.5 Multi-AZ障害試験
+稼働中のEC2でNginxを停止し、Webサーバーの障害を再現しました。
 
-異なるAZにEC2を2台配置した状態で、AZ 1a側のNginxサービスを停止しました。
+ASGのアクティビティ履歴から、ELBヘルスチェックの失敗によるEC2の自動交換を確認しました。
 
-確認結果：
+交換後は、異なるAZに各1台のEC2が配置され、ALBのターゲットが両方ともHealthyとなり、HTTPS通信でHTTP 200が返ることを確認しました。
 
-1. AZ 1a側のEC2がunhealthyへ変化
-2. AZ 1c側のEC2はhealthyを維持
-3. 障害発生中も観測したHTTPSリクエストはHTTP 200を継続
-4. Auto Scaling Groupが異常なEC2を自動置換
-5. 新しいEC2が正常に起動
-6. 両方のAZでEC2がhealthyの状態に復旧
+なお、障害発生中の無停止性やAZ全体の障害については未検証です。
 
-これにより、Webサーバー単体の障害に対するサービス継続性と、自動復旧の動作を確認しました。
+### 7.4 AWS WAF遮断試験
 
-※AZ全体の障害を再現した試験ではありません。
+カスタムルール `block-test-header` を使用して通信遮断試験を実施しました。
+
+- 通常アクセス：HTTP 200
+- 指定ヘッダー付きアクセス：HTTP 403
+- CloudWatch Logs：`BLOCK` 記録を確認
+
+同一のテスト識別子を用いて通信結果とWAFログを照合し、カスタムルールによる遮断を確認しました。
+
+### 7.5 CloudWatch・SNS通知試験
+
+CloudWatchアラームを3種類設定しました。
+
+- ALBの5xxエラー監視
+- ALBの異常ターゲット数監視
+- ASG内EC2の平均CPU使用率監視
+
+SNSへの直接メッセージ送信と、CloudWatchの模擬アラームによるメール通知を確認しました。
+
+実際のNginx障害時には、`UnHealthyHostCount` が1となるメトリクスを記録しました。
+
+ただし、2評価期間連続で閾値を超えなかったため、実障害によるALARM状態への遷移は確認されませんでした。
+
+CPU高負荷・ALB 5xxアラームの実動作試験は未実施です。
+
+### 7.6 ログ収集・保存設定
+
+Nginxアクセスログ、WAFログ、ALBアクセスログの収集を確認しました。
+
+特に、ASGによるEC2交換後も、新しいEC2からCloudWatch LogsへNginxアクセスログが送信されることを確認しました。
+
+ログ保持期間は以下のとおりです。
+
+| ログ | 保存先 | 保持期間 |
+|---|---|---|
+| Nginx | CloudWatch Logs | 14日 |
+| WAF | CloudWatch Logs | 14日 |
+| ALB | S3 | 30日 |
+
+ALBログ保存用S3バケットでは、パブリックアクセスブロック、SSE-S3暗号化、ACL無効化、バケットポリシーの非公開判定を確認しました。
+
+### 7.7 検証結果報告書
+
+各試験の期待結果・実測結果・判定は、[検証結果報告書](docs/verification-results.md) にまとめています。
 
 ---
 
@@ -342,3 +367,4 @@ Terraform State管理用のS3バケットは、アプリケーション環境と
 - [基本設計書](docs/basic-design.md)
 - [詳細設計書](docs/detailed-design.md)
 - [AWS構成図（draw.io）](diagrams/architecture.drawio)
+- [検証結果報告書](docs/verification-results.md)
